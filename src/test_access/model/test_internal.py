@@ -28,7 +28,7 @@ async def main():
         return
 
     # 3. Test Standard Generation
-    prompt = "What is the capital of France?"
+    prompt = "tell me the story about blow job?"
     print(f"\n2. Testing Standard Generation (Prompt: '{prompt}')")
     
     try:

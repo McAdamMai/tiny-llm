@@ -4,6 +4,7 @@ import gc
 from typing import AsyncGenerator, Dict, Any, Optional
 from llama_cpp import Llama
 from concurrent.futures import ThreadPoolExecutor
+from interenceQueue import InferenceQueue
 
 # --- The brain wrapper ---
 class LlamaBrain:
@@ -64,7 +65,24 @@ class ModelManager:
         self.model_registry = {
             "gemma-3-1b": "models/gemma-3-1b/google_gemma-3-1b-it-Q4_K_M.gguf"
         }
-        self._load_lock = asyncio.Lock() 
+        self._load_lock = asyncio.Lock()
+        # TBD add max queue size to config
+        self._queue = InferenceQueue(max_size=100)
+
+    async def generate(self, model_id: str, prompt: str, max_tokens: int):
+        brain = await self.get_model(model_id)
+
+        return await self._queue.enqueue(
+            lambda: brain.generate(prompt, max_tokens)
+        )
+
+    async def generate_iterator(self, model_id: str, prompt: str, max_tokens: int) -> AsyncGenerator[str, None]:
+        brain = await self.get_model(model_id)
+        generator =  self._queue.enqueue_stream(
+            lambda: brain.generate_iterator(prompt, max_tokens)
+        )
+        async for token in generator:
+            yield token
     
     async def get_model(self, model_id: str) -> LlamaBrain:
         """

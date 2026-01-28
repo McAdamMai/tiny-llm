@@ -28,37 +28,31 @@ async def readiness_probe(manager: BrainManager):
 # --- Inference Logic ---
 
 @router.post("/chat/generate", response_model=GenerateResponse)
-async def generate_text(request: GenerateRequest, manager: BrainManager):
-    try:
-        brain = await manager.get_model(request.model)
-
-        if request.stream:
-            return StreamingResponse(
-                stream_generator(
-                    brain,
-                    prompt=request.prompt,
-                    max_new_tokens=request.max_new_tokens,
-                    raw_mode=False  
-                ),
-                media_type="text/event-stream"
-            )
+async def generate_text(request: GenerateRequest, manager: ModelManager = Depends(get_model_manager)):
+    if request.stream:
+        return StreamingResponse(
+            stream_generator(
+                modelManager=manager,       # Pass the manager instance
+                model_id=request.model,     # Pass the model ID from request
+                prompt=request.prompt,
+                max_new_tokens=request.max_new_tokens,
+                raw_mode=False
+            ),
+            media_type="text/event-stream"
+        )
         
-        # Non-streaming
-        output = await brain.generate(
+    # Non-streaming
+    output = await manager.generate(
+            model_id=request.model,
             prompt=request.prompt,
             max_new_tokens=request.max_new_tokens
         )
 
-        return {
+    return {
             "model": request.model, 
             "text": output["text"],
             "usage": output["usage"]
         }
-    except Exception as e:
-        raise HTTPException(
-            status_code=status.HTTP_500_INTERNAL_SERVER_ERROR,
-            detail=str(e)
-        )
 
 @router.post("/completion", response_model=GenerateResponse)
 async def generate_completion(request: GenerateRequest, manager: BrainManager):
