@@ -1,26 +1,40 @@
 # app/core/queue.py
 import asyncio
 from collections import deque
-from typing import Dict
+from typing import Callable, Any, Optional
+
 class InferenceQueue:
     def __init__(self, max_size: int = 100):
         self._queue: deque = deque(maxlen=max_size)
         self._event = asyncio.Event() # Wakes up the worker when new items arrive
         self.processing = False
-        asyncio.create_task(self._worker())
+        self._worker_task = None
 
+    def start_worker(self):
+        if self._worker_task is None:
+            # pop left from the queue and process
+            self.processing = True
+            self._worker_task = asyncio.create_task(self._worker())
+            print("--- Queue Worker Started ---")
+
+    def shutdown(self):
+        """Gracefully shuts down the worker."""
+        self.processing = False
+        if self._worker_task:
+            self._worker_task.cancel()
+            print("--- Queue Worker Stopped ---")
 
     async def enqueue(self, task_fn):
         """
         Enqueue a task and wait for execution.
         Raises: asyncio.QueueFull if queue is full
         """
-        if len(self.queue) >= self._queue.maxlen:
+        if len(self._queue) >= self._queue.maxlen:
             raise asyncio.QueueFull("Inference queue is full")
 
         future = asyncio.Future() # Future as an empty box or a "claim check."
         self._queue.append((task_fn, future))
-        self._event.set()  # Notify the worker
+        self._event.set()  # Notify the _worker
         # Wait here until the worker fills the future
         return await future
 
@@ -30,14 +44,14 @@ class InferenceQueue:
         The worker iterates the generator and pushes items to a private queue.
         """
 
-        if len(self.queue) >= self._queue.maxlen:
+        if len(self._queue) >= self._queue.maxlen:
             raise asyncio.QueueFull("Inference queue is full")
 
         # Create a channel (mini-queue) for the tokens
         stream_channel = asyncio.Queue()
         # Define the work the background worker will do
         async def worker_wrapper():
-           try:
+            try:
                 # The WORKER iterates, holding the semaphore lock
                 async for token in task_fn():
                     await stream_channel.put(token) 
@@ -67,10 +81,16 @@ class InferenceQueue:
         while True:
             if not self._queue:
                 self._event.clear()
-                await self._event.wait()  # Wait until new items arrive
+                await self._event.wait()  # Wait until new items arrive (triggered by enqueue)
             
-            # Get the oldest task
-            task_fn, future = self._queue.popleft()
+            if not self.processing:
+                break  # Exit if shutdown signal is received
+
+            try:
+                # Get the oldest task
+                task_fn, future = self._queue.popleft()
+            except IndexError:
+                continue  # Queue was empty, loop back and wait
 
             if future.cancelled():
                 continue  # Skip cancelled tasks
@@ -86,3 +106,4 @@ class InferenceQueue:
     def depth(self) -> int:
         """Returns current depth of the queue."""
         return len(self._queue)
+

@@ -3,9 +3,9 @@ from fastapi import APIRouter, HTTPException, status, Depends
 from fastapi.responses import StreamingResponse
 from typing import Annotated
 
-from app.schemas.chat import GenerateRequest, GenerateResponse
-from app.core.manager import ModelManager, get_manager
-from app.services.streaming import stream_generator
+from app.schemas.schemas import GenerateRequest, GenerateResponse
+from app.core.modelManager import ModelManager, get_manager
+from app.utils.streaming import stream_generator
 
 router = APIRouter(prefix="/v1", tags=["chat"])
 
@@ -14,8 +14,10 @@ BrainManager = Annotated[ModelManager, Depends(get_manager)]
 
 @router.get("/health/live")
 async def liveness_probe():
+    # Fake liveness probe
     return {"status": "online"}
 
+# Even though the code inside the router is simple, keeping the route itself async is a best practice in FastAPI
 @router.get("/health/ready")
 async def readiness_probe(manager: BrainManager):
     if not manager.is_ready():
@@ -25,10 +27,36 @@ async def readiness_probe(manager: BrainManager):
         )
     return {"status": "ready"}
 
-# --- Inference Logic ---
+@router.post("/completion", response_model=GenerateResponse)
+async def generate_completion(request: GenerateRequest, manager: BrainManager):
+    """
+    Chat endpoint. Safely queues the request.
+    """
+    try:
+        output = await manager.generate_completion(
+        model_id=request.model,
+        prompt=request.prompt,
+        max_tokens=request.max_new_tokens
+    )
+        return {
+            "model": request.model, 
+            "text": output["text"],
+            "usage": output["usage"]
+        }
+    except asyncio.QueueFull:
+        raise HTTPException(
+            status_code=503,
+            detail="Too many concurrent requests. Please try again later."
+        )
+    except Exception as e:
+        raise HTTPException(
+            status_code=500,
+            detail=str(e)
+        )
 
+# --- Inference Logic ---
 @router.post("/chat/generate", response_model=GenerateResponse)
-async def generate_text(request: GenerateRequest, manager: ModelManager = Depends(get_model_manager)):
+async def generate_text(request: GenerateRequest, manager: BrainManager):
     if request.stream:
         return StreamingResponse(
             stream_generator(
@@ -47,43 +75,11 @@ async def generate_text(request: GenerateRequest, manager: ModelManager = Depend
             prompt=request.prompt,
             max_new_tokens=request.max_new_tokens
         )
-
     return {
             "model": request.model, 
             "text": output["text"],
             "usage": output["usage"]
         }
-
-@router.post("/completion", response_model=GenerateResponse)
-async def generate_completion(request: GenerateRequest, manager: BrainManager):
-    """
-    Raw text completion (Autocompletion/IDE style)
-    """
-    brain = await manager.get_model(request.model)
-    
-    if request.stream:
-        return StreamingResponse(
-            stream_generator(
-                brain,
-                prompt=request.prompt,
-                max_new_tokens=request.max_new_tokens,
-                raw_mode=True 
-            ),
-            media_type="text/event-stream"
-        )
-
-    # Run blocking inference in executor
-    loop = asyncio.get_running_loop() 
-    output = await loop.run_in_executor(
-        None,
-        lambda: brain(request.prompt, max_tokens=request.max_new_tokens)
-    )
-    
-    return {
-        "model": request.model, 
-        "text": output["choices"][0]["text"],
-        "usage": output["usage"]
-    }
 
 # --- Resource Management ---
 

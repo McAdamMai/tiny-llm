@@ -4,7 +4,7 @@ import gc
 from typing import AsyncGenerator, Dict, Any, Optional
 from llama_cpp import Llama
 from concurrent.futures import ThreadPoolExecutor
-from interenceQueue import InferenceQueue
+from .interenceQueue import InferenceQueue
 
 # --- The brain wrapper ---
 class LlamaBrain:
@@ -15,8 +15,8 @@ class LlamaBrain:
 
     async def generate(self, prompt: str, max_new_tokens: int) -> Dict[str, Any]:
         """
-        Non-streaming generation.
-        Runs in a separate thread to avoid blocking the main event loop.
+        Async wrapper that offloads blocking C++ inference to a thread.
+        This method returns a Coroutine, which fits perfectly with the Queue.
         """
         loop = asyncio.get_running_loop()
         result = await loop.run_in_executor(
@@ -69,22 +69,55 @@ class ModelManager:
         # TBD add max queue size to config
         self._queue = InferenceQueue(max_size=100)
 
-    async def generate(self, model_id: str, prompt: str, max_tokens: int):
-        brain = await self.get_model(model_id)
+    # --- PUBLIC API ---
+    # no needs to be asynchronized
+    def start_background_tasks(self):
+        self._queue.start_worker()
 
+    # When called, it will free VRAM
+    def unload_model(self, model_id: str):
+        """Frees VRAM by unloading the model."""
+        if model_id in self._models:
+            print(f"---  Unloading model: {model_id} ---")
+            # Deleting the Llama object triggers C++ destructor
+            del self._models[model_id].model 
+            del self._models[model_id]
+            gc.collect()
+            print(f"--- {model_id} unloaded successfully ---")
+    
+    def is_ready(self) -> bool:
+        return len(self._models) > 0
+
+    # Default model_id is set to "gemma-3-1b"
+    async def warmup_models(self, model_id: str = "gemma-3-1b"):
+        print(f"--- Warming up engine: {model_id} ---")
+        try:
+            brain = await self._get_model(model_id)
+        except Exception as e:
+            print(f"Warmup failed: {e}")
+
+    async def shutdown(self):
+        """Gracefully shuts down the worker."""
+        await self._queue.shutdown()
+    
+    async def generate_completion(self, model_id: str, prompt: str, max_tokens: int):
+        brain = await self._get_model(model_id)
+        # use lambda to defer execution, it packs the function and its arguments and send to the queue. worker will call it later (other threads).
         return await self._queue.enqueue(
             lambda: brain.generate(prompt, max_tokens)
         )
 
     async def generate_iterator(self, model_id: str, prompt: str, max_tokens: int) -> AsyncGenerator[str, None]:
-        brain = await self.get_model(model_id)
+        brain = await self._get_model(model_id)
         generator =  self._queue.enqueue_stream(
             lambda: brain.generate_iterator(prompt, max_tokens)
         )
         async for token in generator:
             yield token
+
+    # --- INTERNAL METHOD ---
     
-    async def get_model(self, model_id: str) -> LlamaBrain:
+    async def _get_model(self, model_id: str) -> LlamaBrain:
         """
         Retrieves a loaded model. If not loaded, safeguards VRAM and loads it.
         """
@@ -92,10 +125,10 @@ class ModelManager:
             async with self._load_lock:
                 # Double-check after acquiring lock
                 if model_id not in self._models:
-                    await self.safe_load(model_id)
+                    await self._safe_load(model_id)
         return self._models[model_id]
 
-    async def safe_load(self, model_id: str):
+    async def _safe_load(self, model_id: str):
         """Ensures VRAM is clear before loading a new heavy model."""
         print(f"---  Safe Loading: {model_id} ---")
         
@@ -135,31 +168,6 @@ class ModelManager:
             print(f"Failed to load model: {e}")
             raise e
 
-    def unload_model(self, model_id: str):
-        """Frees VRAM by unloading the model."""
-        if model_id in self._models:
-            print(f"---  Unloading model: {model_id} ---")
-            # Deleting the Llama object triggers C++ destructor
-            del self._models[model_id].model 
-            del self._models[model_id]
-            gc.collect()
-            print(f"--- {model_id} unloaded successfully ---")
-
-    async def warmup_models(self, model_id: str = "gemma-3-1b"):
-        print(f"--- Warming up engine: {model_id} ---")
-        try:
-            brain = await self.get_model(model_id)
-            loop = asyncio.get_running_loop()
-            await loop.run_in_executor(
-                None,
-                lambda: brain.model.create_completion(prompt="Warmup", max_tokens=1)
-            )
-            print(f"--- {model_id} is hot and ready to serve! ---")
-        except Exception as e:
-            print(f"Warmup failed: {e}")
-
-    def is_ready(self) -> bool:
-        return len(self._models) > 0
 
 # Singleton
 manager_instance = ModelManager()

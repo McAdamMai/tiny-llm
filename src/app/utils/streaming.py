@@ -25,11 +25,11 @@ async def stream_generator(modelManager: ModelManager, prompt:str, max_new_token
                 },
                 "usage": None
             }
-            else:
-                # Chat format (standard)
-                chunk_data = {
-                    "text": token,
-                    "finish_reason": None
+        else:
+            # Chat format (standard)
+            chunk_data = {
+                "text": token,
+                "finish_reason": None
             }
             yield f"data: {json.dumps(chunk_data)}\n\n"
             
