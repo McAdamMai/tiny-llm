@@ -39,6 +39,7 @@ FROM python:3.10-slim
 # 1. Install Runtime Drivers
 RUN apt-get update && apt-get install -y \
     libgomp1 libvulkan1 mesa-vulkan-drivers vulkan-tools \
+    libopenblas-0 \
     && rm -rf /var/lib/apt/lists/*
 
 # 2. UNIFY: Set Workdir to /app (Matches Builder)

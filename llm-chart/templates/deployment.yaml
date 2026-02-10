@@ -1,78 +1,51 @@
 apiVersion: apps/v1
 kind: Deployment
 metadata:
-  name: {{ include "llm-chart.fullname" . }}
-  labels:
-    {{- include "llm-chart.labels" . | nindent 4 }}
+  name: llm-deployment
 spec:
-  {{- if not .Values.autoscaling.enabled }}
-  replicas: {{ .Values.replicaCount }}
-  {{- end }}
+  replicas: {{.Values.replicaCount}}
   selector:
     matchLabels:
-      {{- include "llm-chart.selectorLabels" . | nindent 6 }}
+      app: llm-api
+  # the mold of deployment - how to create pods
   template:
     metadata:
-      {{- with .Values.podAnnotations }}
-      annotations:
-        {{- toYaml . | nindent 8 }}
-      {{- end }}
       labels:
-        {{- include "llm-chart.labels" . | nindent 8 }}
-        {{- with .Values.podLabels }}
-        {{- toYaml . | nindent 8 }}
-        {{- end }}
+        app: llm-api
     spec:
-      {{- with .Values.imagePullSecrets }}
-      imagePullSecrets:
-        {{- toYaml . | nindent 8 }}
-      {{- end }}
-      serviceAccountName: {{ include "llm-chart.serviceAccountName" . }}
-      {{- with .Values.podSecurityContext }}
-      securityContext:
-        {{- toYaml . | nindent 8 }}
-      {{- end }}
       containers:
-        - name: {{ .Chart.Name }}
-          {{- with .Values.securityContext }}
-          securityContext:
-            {{- toYaml . | nindent 12 }}
-          {{- end }}
-          image: "{{ .Values.image.repository }}:{{ .Values.image.tag | default .Chart.AppVersion }}"
-          imagePullPolicy: {{ .Values.image.pullPolicy }}
+        - name: llm-container
+          image: "{{.Values.image.repository}}:{{.Values.image.tag}}"
+          imagePullPolicy: "{{.Values.image.pullPolicy}}"
+
           ports:
-            - name: http
-              containerPort: {{ .Values.service.port }}
-              protocol: TCP
-          {{- with .Values.livenessProbe }}
-          livenessProbe:
-            {{- toYaml . | nindent 12 }}
-          {{- end }}
-          {{- with .Values.readinessProbe }}
-          readinessProbe:
-            {{- toYaml . | nindent 12 }}
-          {{- end }}
-          {{- with .Values.resources }}
+            - containerPort: {{.Values.service.port}}
+
+          env:
+            - name: HARDWARE
+              value: "{{.Values.hardware}}"
+
+          # --- DYNAMIC RESOURCES ---
+          # If hardware is GPU, request NVIDIA GPU. 
+          # If CPU, request standard RAM/CPU.
           resources:
-            {{- toYaml . | nindent 12 }}
-          {{- end }}
-          {{- with .Values.volumeMounts }}
+            {{- if eq .Values.hardware "gpu"}}
+            limits:
+              nvidia.com/gpu: 1 # Request 1 GPU
+            {{- else}}
+            limits:
+              cpu: "2"
+              memory: "4Gi"
+            {{- end}}
+          # --- VOLUME MOUNT ---
+          # This plugs the model folder into the container
           volumeMounts:
-            {{- toYaml . | nindent 12 }}
-          {{- end }}
-      {{- with .Values.volumes }}
+            - name: model-storage
+              mountPath: "{{.Values.containerModelPath}}"
       volumes:
-        {{- toYaml . | nindent 8 }}
-      {{- end }}
-      {{- with .Values.nodeSelector }}
-      nodeSelector:
-        {{- toYaml . | nindent 8 }}
-      {{- end }}
-      {{- with .Values.affinity }}
-      affinity:
-        {{- toYaml . | nindent 8 }}
-      {{- end }}
-      {{- with .Values.tolerations }}
-      tolerations:
-        {{- toYaml . | nindent 8 }}
-      {{- end }}
+        - name: model-storage
+          hostPath:
+          # Maps to the path inside the Minikube VM
+            path: "{{.Values.hostModelPath}}"
+            type: DirectoryOrCreate
+          

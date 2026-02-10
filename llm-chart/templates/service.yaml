@@ -1,15 +1,17 @@
 apiVersion: v1
 kind: Service
 metadata:
-  name: {{ include "llm-chart.fullname" . }}
+  name: llm-service
   labels:
-    {{- include "llm-chart.labels" . | nindent 4 }}
+    app: llm-api
 spec:
   type: {{ .Values.service.type }}
+
+  selector:
+    app: llm-api
+  
   ports:
-    - port: {{ .Values.service.port }}
-      targetPort: http
+    - port: 80
+      targetPort: {{ .Values.service.port }}
       protocol: TCP
       name: http
-  selector:
-    {{- include "llm-chart.selectorLabels" . | nindent 4 }}
