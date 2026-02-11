@@ -5,6 +5,7 @@ from typing import AsyncGenerator, Dict, Any, Optional
 from llama_cpp import Llama
 from concurrent.futures import ThreadPoolExecutor
 from .interenceQueue import InferenceQueue
+from fastapi import Request
 
 # --- The brain wrapper ---
 class LlamaBrain:
@@ -49,6 +50,8 @@ class LlamaBrain:
             )
         )
         for chunk in stream_iterator:
+            # Yielding will freeze the main thread for milliseconds, 
+            #asyncio.sleep(0) allows other tasks to run while waiting for the next token.
             await asyncio.sleep(0)  # Yield control to event loop
             token = chunk["choices"][0]["text"]
             yield token
@@ -115,6 +118,9 @@ class ModelManager:
         async for token in generator:
             yield token
 
+    async def generate_chat_completion(self, model_id:str, prompt: str, max_tokens: int):
+        return None  # TBD
+
     # --- INTERNAL METHOD ---
     
     async def _get_model(self, model_id: str) -> LlamaBrain:
@@ -172,5 +178,5 @@ class ModelManager:
 # Singleton
 manager_instance = ModelManager()
 
-def get_manager() -> ModelManager:
-    return manager_instance
+def get_manager(request: Request):
+    return request.app.state.manager

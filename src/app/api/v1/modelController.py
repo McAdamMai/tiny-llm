@@ -1,9 +1,9 @@
 import asyncio
 from fastapi import APIRouter, HTTPException, status, Depends
-from fastapi.responses import StreamingResponse
-from typing import Annotated
+from fastapi.responses import StreamingResponse, JSONResponse
+from typing import Annotated, Union
 
-from app.schemas.schemas import GenerateRequest, GenerateResponse
+from app.schemas.schemas import GenerateRequest, GenerateResponse, GenerateStreamChunk
 from app.core.modelManager import ModelManager, get_manager
 from app.utils.streaming import stream_generator
 
@@ -27,34 +27,58 @@ async def readiness_probe(manager: BrainManager):
         )
     return {"status": "ready"}
 
-@router.post("/completion", response_model=GenerateResponse)
-async def generate_completion(request: GenerateRequest, manager: BrainManager):
-    """
-    Chat endpoint. Safely queues the request.
-    """
+@router.post("/completions", response_model=None)
+async def generate_completion(
+    request: GenerateRequest, 
+    manager: BrainManager
+) -> Union[GenerateResponse, StreamingResponse]:
+    
     try:
-        output = await manager.generate_completion(
-        model_id=request.model,
-        prompt=request.prompt,
-        max_tokens=request.max_new_tokens
-    )
-        return {
-            "model": request.model, 
-            "text": output["text"],
-            "usage": output["usage"]
-        }
-    except asyncio.QueueFull:
-        raise HTTPException(
-            status_code=503,
-            detail="Too many concurrent requests. Please try again later."
-        )
-    except Exception as e:
-        raise HTTPException(
-            status_code=500,
-            detail=str(e)
-        )
+        # === BRANCH 1: STREAMING ===
+        if request.stream:
+            # Get the iterator from your manager (the one yielding raw tokens)
+            raw_iterator = manager.generate_iterator(
+                model_id=request.model,
+                prompt=request.prompt,
+                max_tokens=request.max_new_tokens
+            )
 
-# --- Inference Logic ---
+            # Define a helper to format tokens into Server-Sent Events (SSE)
+            async def sse_generator():
+                async for token in raw_iterator:
+                    # Wrap the raw string in a JSON object for the client
+                    chunk_data = GenerateStreamChunk(text=token).model_dump_json()
+                    yield f"data: {chunk_data}\n\n"
+                
+                # Signal the end of the stream
+                yield "data: [DONE]\n\n"
+
+            return StreamingResponse(
+                sse_generator(), 
+                media_type="text/event-stream"
+            )
+
+        # === BRANCH 2: NON-STREAMING ===
+        else:
+            output = await manager.generate_completion(
+                model_id=request.model,
+                prompt=request.prompt,
+                max_tokens=request.max_new_tokens
+            )
+            
+            # Return the Pydantic model directly
+            return GenerateResponse(
+                model=request.model,
+                text=output["text"],
+                usage=output["usage"]
+            )
+
+    except asyncio.QueueFull:
+        raise HTTPException(status_code=503, detail="Server busy")
+    except Exception as e:
+        raise HTTPException(status_code=500, detail=str(e))
+
+"""# --- Inference Logic ---
 @router.post("/chat/generate", response_model=GenerateResponse)
 async def generate_text(request: GenerateRequest, manager: BrainManager):
     if request.stream:
@@ -80,7 +104,7 @@ async def generate_text(request: GenerateRequest, manager: BrainManager):
             "text": output["text"],
             "usage": output["usage"]
         }
-
+"""
 # --- Resource Management ---
 
 @router.delete("/manage/unload/{model_id}")

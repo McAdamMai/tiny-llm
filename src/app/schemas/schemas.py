@@ -1,4 +1,5 @@
 from pydantic import BaseModel, Field
+from typing import Optional
 
 class GenerateRequest(BaseModel):
     model: str = Field(..., description="The model to use for generation", example="gemma-3-1b")
@@ -10,3 +11,8 @@ class GenerateResponse(BaseModel):
     model: str
     text: str
     usage: dict
+
+# Used for stream=True (Each chunk follows this format)
+class GenerateStreamChunk(BaseModel):
+    text: str
+    finish_reason: Optional[str] = None

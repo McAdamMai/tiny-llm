@@ -49,7 +49,9 @@ class InferenceQueue:
 
         # Create a channel (mini-queue) for the tokens
         stream_channel = asyncio.Queue()
+        future = asyncio.Future() # Future as an empty box or a "claim check."
         # Define the work the background worker will do
+        # Oridinarily worker just returns a string but wrapper will push tokens to the channel
         async def worker_wrapper():
             try:
                 # The WORKER iterates, holding the semaphore lock
@@ -64,7 +66,7 @@ class InferenceQueue:
 
         # Add this wrapper to the main queue
         # We don't use a future here because we return a generator immediately
-        self._queue.append((worker_wrapper, asyncio.Future())) 
+        self._queue.append((worker_wrapper, future)) 
         self._event.set()
 
         # Return a generator that reads from the channel
@@ -106,4 +108,3 @@ class InferenceQueue:
     def depth(self) -> int:
         """Returns current depth of the queue."""
         return len(self._queue)
-
