@@ -37,7 +37,7 @@ async def generate_completion(
         # === BRANCH 1: STREAMING ===
         if request.stream:
             # Get the iterator from your manager (the one yielding raw tokens)
-            raw_iterator = manager.generate_iterator(
+            raw_iterator = await manager.generate_iterator(
                 model_id=request.model,
                 prompt=request.prompt,
                 max_tokens=request.max_new_tokens
@@ -54,7 +54,7 @@ async def generate_completion(
                 yield "data: [DONE]\n\n"
 
             return StreamingResponse(
-                sse_generator(), 
+                sse_generator(), # Use this helper to generate json iterator
                 media_type="text/event-stream"
             )
 

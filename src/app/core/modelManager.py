@@ -14,6 +14,7 @@ class LlamaBrain:
         self.model_id = model_id
         self._executor = ThreadPoolExecutor(max_workers=1)
 
+    # Sync method that runs in the worker thread, so it can call the blocking llama_cpp code directly.
     async def generate(self, prompt: str, max_new_tokens: int) -> Dict[str, Any]:
         """
         Async wrapper that offloads blocking C++ inference to a thread.
@@ -34,27 +35,6 @@ class LlamaBrain:
             "text": result["choices"][0]["text"],
             "usage": result["usage"]
         }
-    
-    async def generate_iterator(self, prompt: str, max_new_tokens: int) -> AsyncGenerator[str, None]:
-        """
-        Async generator that yields tokens one by one.
-        """
-        loop = asyncio.get_running_loop()
-        stream_iterator = await loop.run_in_executor(
-            self._executor,
-            lambda: self.model.create_completion(
-                prompt=prompt,
-                max_tokens=max_new_tokens,
-                stream=True,
-                echo=False
-            )
-        )
-        for chunk in stream_iterator:
-            # Yielding will freeze the main thread for milliseconds, 
-            #asyncio.sleep(0) allows other tasks to run while waiting for the next token.
-            await asyncio.sleep(0)  # Yield control to event loop
-            token = chunk["choices"][0]["text"]
-            yield token
 
     def __call__(self, prompt: str, max_tokens: int):
         """Allows the instance to be called like a function (for raw completion endpoint)"""
@@ -110,13 +90,18 @@ class ModelManager:
             lambda: brain.generate(prompt, max_tokens)
         )
 
-    async def generate_iterator(self, model_id: str, prompt: str, max_tokens: int) -> AsyncGenerator[str, None]:
+    async def generate_iterator(self, model_id: str, prompt: str, max_tokens: int):
         brain = await self._get_model(model_id)
-        generator =  self._queue.enqueue_stream(
-            lambda: brain.generate_iterator(prompt, max_tokens)
+        
+        # Just pass the raw blocking function!
+        # Note: We do NOT call it here (no parenthesis), we pass the lambda
+        return await self._queue.enqueue_stream(
+            lambda: brain.model.create_completion(
+                prompt=prompt,
+                max_tokens=max_tokens,
+                stream=True
+            )
         )
-        async for token in generator:
-            yield token
 
     async def generate_chat_completion(self, model_id:str, prompt: str, max_tokens: int):
         return None  # TBD

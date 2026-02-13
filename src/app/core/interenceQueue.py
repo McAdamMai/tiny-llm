@@ -37,8 +37,59 @@ class InferenceQueue:
         self._event.set()  # Notify the _worker
         # Wait here until the worker fills the future
         return await future
-
+    
     async def enqueue_stream(self, task_fn):
+        """
+        Special handling for generators. 
+        The worker iterates the generator and pushes items to a private queue.
+        """
+        if len(self._queue) >= self._queue.maxlen:
+            raise asyncio.QueueFull("Inference queue is full")
+
+        # Create a channel (mini-queue) for the tokens
+        stream_channel = asyncio.Queue()
+        loop = asyncio.get_running_loop()
+        future = asyncio.Future() 
+
+        # Define the work the background worker will do
+        def sync_worker_logic():
+            try:
+                # A. Execute the blocking model call to get the iterator
+                # task_fn is now just "lambda: brain.model.create_completion(...)"
+                sync_iterator = task_fn()
+
+                # B. Iterate synchronously (Blocking!)
+                for chunk in sync_iterator:
+                    # Extract text (Data extraction logic moved here)
+                    token = chunk["choices"][0]["text"]
+                    
+                    # C. Push to Async Queue safely
+                    loop.call_soon_threadsafe(stream_channel.put_nowait, token)
+
+            except Exception as e:
+                loop.call_soon_threadsafe(stream_channel.put_nowait, e)
+            finally:
+                # Signal the end
+                loop.call_soon_threadsafe(stream_channel.put_nowait, StopAsyncIteration)
+
+        # Add this wrapper to the main queue
+        self._queue.append((sync_worker_logic, future))
+        self._event.set()
+
+        # 4. Define the generator that the API CALLER will receive
+        async def response_generator():
+            while True:
+                token = await stream_channel.get()
+                if token is StopAsyncIteration:
+                    break
+                if isinstance(token, Exception):
+                    raise token
+                yield token
+
+        return response_generator()
+
+    # "Sync Core, Async Shell" pattern
+    async def enqueue_stream_1(self, task_fn):
         """
         Special handling for generators. 
         The worker iterates the generator and pushes items to a private queue.
@@ -48,34 +99,40 @@ class InferenceQueue:
             raise asyncio.QueueFull("Inference queue is full")
 
         # Create a channel (mini-queue) for the tokens
-        stream_channel = asyncio.Queue()
-        future = asyncio.Future() # Future as an empty box or a "claim check."
-        # Define the work the background worker will do
-        # Oridinarily worker just returns a string but wrapper will push tokens to the channel
-        async def worker_wrapper():
+        stream_channel = asyncio.Queue() # main thread reads from this
+        loop = asyncio.get_running_loop() # Capture the Main Loop
+
+        # Worker_wrapper must be a standard def (Sync) so the thread actually executes the code.
+        def worker_wrapper():
+            print("--- Worker Started ---")
             try:
+                # Execute the Blocking Brain logic
+                sync_iterator = task_fn()
+                print("--- Iterator Created ---")
                 # The WORKER iterates, holding the semaphore lock
-                async for token in task_fn():
-                    await stream_channel.put(token) 
+                for chunk in sync_iterator: # task_fn running on background thread
+                    token = chunk["choices"][0]["text"]
+                    print(f"Generated: {repr(token)}")
+                    loop.call_soon_threadsafe(stream_channel.put_nowait, token)
+                    
             except Exception as e:
                 # Pass exception to consumer
-                await stream_channel.put(e)
+                print(f"!!! CRASH IN WORKER: {e}")
+                loop.call_soon_threadsafe(stream_channel.put_nowait, e)
             finally:
-                # Signal the end
-                await stream_channel.put(StopAsyncIteration)
-
+                # Signal "Done"
+                print("--- Worker Finished ---")
+                loop.call_soon_threadsafe(stream_channel.put_nowait, StopAsyncIteration)
         # Add this wrapper to the main queue
         # We don't use a future here because we return a generator immediately
-        self._queue.append((worker_wrapper, future)) 
+        self._queue.append(worker_wrapper)
         self._event.set()
 
-        # Return a generator that reads from the channel
+        # 4. Consumption (Main Thread)
         while True:
             token = await stream_channel.get()
-            if token is StopAsyncIteration:
-                break
-            if isinstance(token, Exception):
-                raise token
+            if token is StopAsyncIteration: break
+            if isinstance(token, Exception): raise token
             yield token
 
     async def _worker(self):
