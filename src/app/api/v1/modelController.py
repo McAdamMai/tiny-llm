@@ -1,9 +1,10 @@
 import asyncio
+import json
 from fastapi import APIRouter, HTTPException, status, Depends
 from fastapi.responses import StreamingResponse, JSONResponse
 from typing import Annotated, Union
 
-from app.schemas.schemas import GenerateRequest, GenerateResponse, GenerateStreamChunk
+from app.schemas.schemas import GenerateRequest, GenerateResponse, GenerateStreamChunk, ChatCompletionRequest
 from app.core.modelManager import ModelManager, get_manager
 from app.utils.streaming import stream_generator
 
@@ -34,6 +35,8 @@ async def generate_completion(
 ) -> Union[GenerateResponse, StreamingResponse]:
     
     try:
+        if not request.prompt:
+            raise HTTPException(status_code=400, detail="Prompt cannot be empty")
         # === BRANCH 1: STREAMING ===
         if request.stream:
             # Get the iterator from your manager (the one yielding raw tokens)
@@ -55,7 +58,8 @@ async def generate_completion(
 
             return StreamingResponse(
                 sse_generator(), # Use this helper to generate json iterator
-                media_type="text/event-stream"
+                media_type="text/event-stream",
+                headers={"Cache-Control": "no-cache", "Connection": "keep-alive"}
             )
 
         # === BRANCH 2: NON-STREAMING ===
@@ -66,10 +70,12 @@ async def generate_completion(
                 max_tokens=request.max_new_tokens
             )
             
+            generated_text = output["choices"][0]["text"]
+
             # Return the Pydantic model directly
             return GenerateResponse(
                 model=request.model,
-                text=output["text"],
+                text=generated_text,
                 usage=output["usage"]
             )
 
@@ -78,33 +84,55 @@ async def generate_completion(
     except Exception as e:
         raise HTTPException(status_code=500, detail=str(e))
 
-"""# --- Inference Logic ---
-@router.post("/chat/generate", response_model=GenerateResponse)
-async def generate_text(request: GenerateRequest, manager: BrainManager):
-    if request.stream:
-        return StreamingResponse(
-            stream_generator(
-                modelManager=manager,       # Pass the manager instance
-                model_id=request.model,     # Pass the model ID from request
-                prompt=request.prompt,
-                max_new_tokens=request.max_new_tokens,
-                raw_mode=False
-            ),
-            media_type="text/event-stream"
-        )
+# --- CHAT ENDPOINTS ---
+@router.post("/chat/completions", response_model=None)
+async def generate_chat_completion(
+    request: ChatCompletionRequest,
+    manager: BrainManager
+) -> Union[JSONResponse, StreamingResponse]:
+    try:
+        if not request.messages:
+            raise HTTPException(status_code=400, detail="Messages cannot be empty")
         
-    # Non-streaming
-    output = await manager.generate(
-            model_id=request.model,
-            prompt=request.prompt,
-            max_new_tokens=request.max_new_tokens
-        )
-    return {
-            "model": request.model, 
-            "text": output["text"],
-            "usage": output["usage"]
-        }
-"""
+        if request.stream:
+            raw_iterator = await manager.generate_chat_iterator(request)
+            
+            async def sse_generator():
+                import time
+                chat_id = f"chatcmpl-{int(time.time())}"
+
+                async for delta in raw_iterator:
+                    chunk_data = {
+                        "id": chat_id,
+                        "object": "chat.completion.chunk",
+                        "created": int(time.time()),
+                        "model": request.model,
+                        "choices": [
+                            {
+                                "index": 0,
+                                "delta": {"content": delta},
+                                "finish_reason": None
+                            }
+                        ]
+                    }
+                    # Use json.dumps for speed
+                    yield f"data: {json.dumps(chunk_data)}\n\n"
+                # Signal the end of the stream
+                yield "data: [DONE]\n\n"
+            return StreamingResponse(
+                sse_generator(),
+                media_type="text/event-stream")
+
+        else:
+            full_response = await manager.generate_chat_completion(request)
+            return JSONResponse(content=full_response)
+
+    except asyncio.QueueFull:
+        raise HTTPException(status_code=503, detail="Server busy")
+    except Exception as e:
+        raise HTTPException(status_code=500, detail=str(e))
+
+
 # --- Resource Management ---
 
 @router.delete("/manage/unload/{model_id}")

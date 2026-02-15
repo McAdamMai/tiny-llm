@@ -6,12 +6,13 @@ from llama_cpp import Llama
 from concurrent.futures import ThreadPoolExecutor
 from .interenceQueue import InferenceQueue
 from fastapi import Request
+from app.schemas.schemas import ChatCompletionRequest
 
 # --- The brain wrapper ---
 class LlamaBrain:
     def __init__(self, model: Llama, model_id: str):
-        self.model = model
         self.model_id = model_id
+        self.model = model
         self._executor = ThreadPoolExecutor(max_workers=1)
 
     # Sync method that runs in the worker thread, so it can call the blocking llama_cpp code directly.
@@ -52,61 +53,126 @@ class ModelManager:
         # TBD add max queue size to config
         self._queue = InferenceQueue(max_size=100)
 
-    # --- PUBLIC API ---
-    # no needs to be asynchronized
+    # --- Lifecycle --- 
     def start_background_tasks(self):
         self._queue.start_worker()
-
-    # When called, it will free VRAM
-    def unload_model(self, model_id: str):
-        """Frees VRAM by unloading the model."""
-        if model_id in self._models:
-            print(f"---  Unloading model: {model_id} ---")
-            # Deleting the Llama object triggers C++ destructor
-            del self._models[model_id].model 
-            del self._models[model_id]
-            gc.collect()
-            print(f"--- {model_id} unloaded successfully ---")
-    
-    def is_ready(self) -> bool:
-        return len(self._models) > 0
-
-    # Default model_id is set to "gemma-3-1b"
-    async def warmup_models(self, model_id: str = "gemma-3-1b"):
-        print(f"--- Warming up engine: {model_id} ---")
-        try:
-            brain = await self._get_model(model_id)
-        except Exception as e:
-            print(f"Warmup failed: {e}")
 
     async def shutdown(self):
         """Gracefully shuts down the worker."""
         await self._queue.shutdown()
+
+    def is_ready(self) -> bool:
+        return len(self._models) > 0
     
-    async def generate_completion(self, model_id: str, prompt: str, max_tokens: int):
+    # --- Exposed API --- 
+    async def generate_completion(self, model_id: str, prompt: str, max_tokens: int): # need to define return type TBD
         brain = await self._get_model(model_id)
         # use lambda to defer execution, it packs the function and its arguments and send to the queue. worker will call it later (other threads).
-        return await self._queue.enqueue(
-            lambda: brain.generate(prompt, max_tokens)
+        task_future = await self._queue.enqueue(
+            lambda: brain.model.create_completion(
+                prompt=prompt,
+                max_tokens=max_tokens,
+                stream=False,
+                echo=False
+            )
         )
+        return await task_future
 
     async def generate_iterator(self, model_id: str, prompt: str, max_tokens: int):
         brain = await self._get_model(model_id)
         
-        # Just pass the raw blocking function!
-        # Note: We do NOT call it here (no parenthesis), we pass the lambda
-        return await self._queue.enqueue_stream(
-            lambda: brain.model.create_completion(
+        loop = asyncio.get_running_loop()
+        stream_queue = asyncio.Queue()
+
+        # Producer runs in background thread, pushing tokens to the stream_queue
+        def blocking_producer():
+            try:
+                iterator = brain.model.create_completion(
                 prompt=prompt,
                 max_tokens=max_tokens,
                 stream=True
+                )
+
+                for chunk in iterator:
+                    text = chunk["choices"][0]["text"]
+                    # Push token to the main thread queue safely once it's generated
+                    loop.call_soon_threadsafe(stream_queue.put_nowait, text)
+                # Signal completion
+                loop.call_soon_threadsafe(stream_queue.put_nowait, StopAsyncIteration)
+            except Exception as e:
+                loop.call_soon_threadsafe(stream_queue.put_nowait, e)
+        # Enqueue the producer (Fire and Forget)
+        await self._queue.enqueue(blocking_producer)
+        # Consumer runs in the main thread, yielding tokens to FastAPI
+        async def response_generator():
+            while True:
+                token = await stream_queue.get()
+                if token is StopAsyncIteration:
+                    break
+                if isinstance(token, Exception):
+                    raise token
+                yield token
+        return response_generator()
+
+    # --- CHAT METHOD --- 
+    async def generate_chat_completion(self, request: ChatCompletionRequest):
+        brain = await self._get_model(request.model)
+
+        # We convert Pydantic objects to pure dicts for llama_cpp
+        messages_payload = [m.model_dump() for m in request.messages]
+
+        # for create_chat_completion, it doesn't accept string based prompt, it requires messages. 
+        task_future = await self._queue.enqueue(
+            lambda: brain.model.create_chat_completion(
+                messages=messages_payload,
+                max_tokens=request.max_new_tokens,
+                temperature=request.temperature,
+                stream=False
             )
         )
 
-    async def generate_chat_completion(self, model_id:str, prompt: str, max_tokens: int):
-        return None  # TBD
+        return await task_future
 
-    # --- INTERNAL METHOD ---
+    async def generate_chat_iterator(self, request: ChatCompletionRequest):
+        brain = await self._get_model(request.model)
+        stream_queue = asyncio.Queue()
+        loop = asyncio.get_running_loop()
+        messages_payload = [m.model_dump() for m in request.messages]
+
+        def blocking_producer():
+            try:
+                iterator = brain.model.create_chat_completion(
+                    messages=messages_payload,
+                    max_tokens=request.max_new_tokens,
+                    temperature=request.temperature,
+                    stream=True
+                )
+                for chunk in iterator:
+                    delt = chunk["choices"][0]["delta"]
+                    content = delt.get("content", "")
+
+                    if content:
+                        loop.call_soon_threadsafe(stream_queue.put_nowait, content)
+                # Signal completion
+                loop.call_soon_threadsafe(stream_queue.put_nowait, StopAsyncIteration)
+            
+            except Exception as e:
+                loop.call_soon_threadsafe(stream_queue.put_nowait, e)
+        
+        # Consumer
+        await self._queue.enqueue(blocking_producer)
+
+        async def response_generator():
+            while True:
+                token = await stream_queue.get()
+                if token is StopAsyncIteration:
+                    break
+                if isinstance(token, Exception):
+                    raise token
+                yield token
+        return response_generator()
+
+    # --- UTILITY METHOD ---
     
     async def _get_model(self, model_id: str) -> LlamaBrain:
         """
@@ -127,7 +193,7 @@ class ModelManager:
         current_models = list(self._models.keys())
         for existing_model in current_models:
             if existing_model != model_id:
-                self.unload_model(existing_model)
+                self._unload_model(existing_model)
 
         # 2. Load the requested model if missing
         if model_id not in self._models:
@@ -158,7 +224,17 @@ class ModelManager:
         except Exception as e:
             print(f"Failed to load model: {e}")
             raise e
-
+    
+        # When called, it will free VRAM
+    def _unload_model(self, model_id: str):
+        """Frees VRAM by unloading the model."""
+        if model_id in self._models:
+            print(f"---  Unloading model: {model_id} ---")
+            # Deleting the Llama object triggers C++ destructor
+            del self._models[model_id].model 
+            del self._models[model_id]
+            gc.collect()
+            print(f"--- {model_id} unloaded successfully ---")
 
 # Singleton
 manager_instance = ModelManager()
